@@ -146,15 +146,27 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT note_id FROM (SELECT note_id FROM notes WHERE vault_id = ?1
-                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__')
-                 UNION SELECT note_id FROM updates WHERE vault_id = ?1
-                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__'))",
+                 UNION SELECT note_id FROM updates WHERE vault_id = ?1)",
             )
             .unwrap();
         stmt.query_map([vault_id], |r| r.get(0))
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
+    }
+
+    /// Jumlah catatan NYATA (tanpa dokumen metadata internal) — untuk dashboard & /info.
+    pub fn count_real_notes(&self, vault_id: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT note_id FROM notes WHERE vault_id = ?1
+             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__')
+             UNION SELECT note_id FROM updates WHERE vault_id = ?1
+             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__'))",
+            [vault_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
     pub fn load_doc_blobs(&self, vault_id: &str, note_id: &str) -> Vec<Vec<u8>> {

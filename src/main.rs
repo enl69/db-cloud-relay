@@ -75,34 +75,28 @@ async fn main() {
 }
 
 async fn dashboard(State(state): State<Arc<AppState>>) -> String {
-    let conn = state.store.conn.lock().unwrap();
-    let mut output = String::from("Database Cloud Relay berhasil berjalan.\n\n");
-    output.push_str("Status: OK\n");
-
-    let mut stmt = conn
-        .prepare("SELECT id, last_update FROM vaults ORDER BY created_at")
-        .expect("failed to read vault summary");
-    let rows = stmt
-        .query_map([], |row| {
+    // kumpulkan ringkasan vault dalam scope lock sendiri (JANGAN pegang lock
+    // saat memanggil count_real_notes — deadlock)
+    let vault_rows: Vec<(String, i64)> = {
+        let conn = state.store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, last_update FROM vaults ORDER BY created_at")
+            .expect("failed to read vault summary");
+        stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })
-        .expect("failed to query vault summary");
+        .expect("failed to query vault summary")
+        .filter_map(|r| r.ok())
+        .collect()
+    };
 
+    let mut output = String::from("Database Cloud Relay berhasil berjalan.\n\n");
+    output.push_str("Status: OK\n");
     let mut total_notes = 0_i64;
     let mut total_vaults = 0_i64;
     output.push_str("Vault detail:\n");
-    for row in rows.flatten() {
-        let (id, last_update) = row;
-        let notes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM (SELECT note_id FROM notes WHERE vault_id = ?1
-                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__')
-                 UNION SELECT note_id FROM updates WHERE vault_id = ?1
-                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__'))",
-                [&id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+    for (id, last_update) in vault_rows {
+        let notes: i64 = state.store.count_real_notes(&id);
         total_vaults += 1;
         total_notes += notes;
         let short_id = &id[..id.len().min(8)];
