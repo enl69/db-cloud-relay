@@ -7,7 +7,7 @@
 ## 1. Gambaran Besar
 
 DB Cloud Relay adalah server sinkronisasi untuk plugin Obsidian "Cloud Relay"
-(repo terpisah: `enlnlnl79/cloud-relay`). Keduanya menyinkronkan vault
+(repo terpisah: `enl69/cloud-relay`). Keduanya menyinkronkan vault
 Obsidian antar device secara **realtime per kata, offline-first, tanpa
 konflik**.
 
@@ -133,7 +133,7 @@ curl localhost:18080/healthz        # → "ok"
 docker logs | grep ADMIN_TOKEN      # (produksi)
 
 # produksi (server user)
-git clone https://github.com/enlnlnl79/db-cloud-relay.git
+git clone https://github.com/enl69/db-cloud-relay.git
 cd db-cloud-relay && docker compose up -d   # port 1111, data di ./data
 
 # update (cara resmi saat ini)
@@ -179,7 +179,7 @@ protokol jika menulis client baru.
 ## 8. Roadmap / Pekerjaan Lanjutan
 
 1. **Rencana ops (disetujui, ditunda sampai stabil)**: GitHub Actions
-   build+push ke `ghcr.io/enlnlnl79/db-cloud-relay` + Watchtower di server
+   build+push ke `ghcr.io/enl69/db-cloud-relay` + Watchtower di server
    → auto-update image, tanpa build di server.
 2. Multi-vault UI (endpoint sudah siap; plugin saat ini 1 vault aktif).
 3. GC blob (hapus blob tak tersisa direferensikan catatan mana pun) —

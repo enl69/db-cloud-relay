@@ -7,7 +7,7 @@ Server sinkronisasi Cloud Relay (Rust: axum + yrs + SQLite). Single binary / Doc
 ## Install di server
 
 ```bash
-git clone https://github.com/enlnlnl79/db-cloud-relay.git
+git clone https://github.com/enl69/db-cloud-relay.git
 cd db-cloud-relay
 docker compose up -d        # jalan di port 1111, data di ./data
 ```
@@ -19,7 +19,7 @@ git pull
 docker compose up -d --build
 ```
 
-Expose via Cloudflare Tunnel → `dbcloudrelay.enlnlnl79.my.id → localhost:1111`.
+Expose via Cloudflare Tunnel → `relay.domainkamu.com → localhost:1111`.
 Backup cukup folder `./data`.
 
 ## Dev lokal
