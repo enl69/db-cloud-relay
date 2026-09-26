@@ -1,0 +1,5 @@
+{
+  "name": "dbcloudrelay-e2e",
+  "private": true,
+  "dependencies": { "yjs": "^13.6.0" }
+}

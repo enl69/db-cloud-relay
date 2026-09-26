@@ -1,0 +1,10 @@
+services:
+  dbcloudrelay:
+    build: .
+    # Nanti setelah publish: image: ghcr.io/enlnlnl79/dbcloudrelay:latest
+    container_name: dbcloudrelay
+    ports:
+      - "1111:8080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
