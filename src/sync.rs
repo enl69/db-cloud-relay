@@ -29,6 +29,10 @@ pub struct BroadcastMsg {
 pub struct VaultRoom {
     docs: Mutex<HashMap<String, Arc<Mutex<Doc>>>>,
     tx: broadcast::Sender<BroadcastMsg>,
+    /// generation bertambah setiap reset; koneksi lama (generation beda)
+    /// berhenti memproses/menyiarkan frame — mencegah klien state-basi
+    /// mengotori vault yang baru direset.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl VaultRoom {
@@ -37,11 +41,18 @@ impl VaultRoom {
         VaultRoom {
             docs: Mutex::new(HashMap::new()),
             tx,
+            generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
     pub fn reset(&self) {
         self.docs.lock().unwrap().clear();
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn doc(&self, store: &Store, vault_id: &str, note_id: &str) -> Arc<Mutex<Doc>> {
@@ -106,6 +117,9 @@ pub async fn handle_socket(
 ) {
     info!(%vault_id, conn_id, "device connected");
 
+    let conn_generation = room.generation();
+    let generation_room = room.clone();
+
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut bcast = room.tx.subscribe();
@@ -145,7 +159,33 @@ pub async fn handle_socket(
         }
     });
 
-    while let Some(Ok(Message::Binary(data))) = stream.next().await {
+    let mut stream_pin = stream;
+    let reset_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rf = reset_flag.clone();
+    let conn_generation = conn_generation;
+    let generation_room = generation_room.clone();
+    let rf_watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if generation_room.generation() != conn_generation {
+                info!("room reset — koneksi basi dihentikan");
+                reset_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+        }
+    });
+
+    loop {
+        if rf.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let next = tokio::select! {
+            m = stream_pin.next() => m,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if rf.load(std::sync::atomic::Ordering::SeqCst) { None } else { continue }
+            }
+        };
+        let Some(Ok(Message::Binary(data))) = next else { break };
         let Some((msg_type, note_id, payload)) = parse_frame(&data) else {
             continue;
         };
@@ -201,6 +241,7 @@ pub async fn handle_socket(
         }
     }
 
+    rf_watcher.abort();
     drop(writer);
     info!(%vault_id, conn_id, "device disconnected");
 }
