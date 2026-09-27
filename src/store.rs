@@ -79,9 +79,9 @@ impl Store {
         let notes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM (SELECT note_id FROM notes WHERE vault_id = ?1
-                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__')
+                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__', '__devices__')
                  UNION SELECT note_id FROM updates WHERE vault_id = ?1
-                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__'))",
+                 AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__', '__devices__'))",
                 [vault_id],
                 |r| r.get(0),
             )
@@ -199,9 +199,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM (SELECT note_id FROM notes WHERE vault_id = ?1
-             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__')
+             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__', '__devices__')
              UNION SELECT note_id FROM updates WHERE vault_id = ?1
-             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__'))",
+             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__', '__devices__'))",
             [vault_id],
             |r| r.get(0),
         )
