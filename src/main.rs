@@ -61,6 +61,7 @@ async fn main() {
         .route("/v1/vaults/{vault_id}/reset", post(reset_vault))
         .route("/v1/vaults/{vault_id}/info", get(vault_info))
         .route("/v1/vaults/{vault_id}/ids", get(vault_ids))
+        .route("/v1/vaults/{vault_id}/counts", get(vault_counts))
         .route("/v1/blobs/{sha}", get(get_blob).put(put_blob))
         .route("/sync/{vault_id}", get(sync_ws))
         .layer(middleware::from_fn(cors_mw))
@@ -252,6 +253,37 @@ async fn get_blob(
             .into_response()),
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+
+#[derive(Serialize)]
+struct VaultCountsResponse {
+    notes: i64,
+    attachments: i64,
+    folders: i64,
+    devices: i64,
+}
+
+async fn vault_counts(
+    Path(vault_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<VaultCountsResponse>, StatusCode> {
+    let token = params.get("token").cloned().unwrap_or_default();
+    if !state.store.vault_token_valid(&vault_id, &token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let store = &state.store;
+    let notes = store.count_real_notes(&vault_id);
+    let attachments = store.count_map_entries(&vault_id, "__attachments__", "files");
+    let folders = store.count_map_entries(&vault_id, "__folders__", "meta");
+    let devices = store.count_map_entries(&vault_id, "__devices__", "meta");
+    Ok(Json(VaultCountsResponse {
+        notes,
+        attachments,
+        folders,
+        devices,
+    }))
 }
 
 async fn sync_ws(

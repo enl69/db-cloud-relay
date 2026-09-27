@@ -2,6 +2,10 @@ use rand::Rng;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
+use yrs::updates::decoder::Decode;
+use yrs::types::Map;
+use yrs::{Doc, Out, ReadTxn, Transact, Update};
+use yrs::types::MapRef;
 
 pub struct Store {
     pub conn: Mutex<Connection>,
@@ -153,6 +157,41 @@ impl Store {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
+    }
+
+
+    /// Hitung jumlah entry aktif (non-deleted) pada dokumen metadata CRDT.
+    /// `map_name`: "files" untuk __attachments__, "meta" untuk lainnya.
+    pub fn count_map_entries(&self, vault_id: &str, note_id: &str, map_name: &str) -> i64 {
+        let blobs = self.load_doc_blobs(vault_id, note_id);
+        if blobs.is_empty() {
+            return 0;
+        }
+        let doc = Doc::new();
+        for blob in &blobs {
+            if let Ok(update) = Update::decode_v1(blob.as_slice()) {
+                let mut txn = doc.transact_mut();
+                let _ = txn.apply_update(update);
+            }
+        }
+        let txn = doc.transact();
+        let map = txn.get_map(map_name);
+        let mut count = 0i64;
+        if let Some(map) = map {
+            for (_key, value) in map.iter(&txn) {
+                let deleted = match value {
+                    Out::YMap(entry) => matches!(
+                        entry.get(&txn, "deleted"),
+                        Some(Out::Any(yrs::Any::Bool(true)))
+                    ),
+                    _ => false,
+                };
+                if !deleted {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     /// Jumlah catatan NYATA (tanpa dokumen metadata internal) — untuk dashboard & /info.
