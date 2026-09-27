@@ -193,18 +193,33 @@ pub async fn handle_socket(
 
         match msg_type {
             MSG_SYNC_STEP1 => {
+                let client_sv_empty = StateVector::decode_v1(payload)
+                    .map(|sv| sv.is_empty())
+                    .unwrap_or(true);
                 let doc = doc.lock().unwrap();
                 let txn = doc.transact();
+                // apakah server benar-benar punya isi note ini?
+                let server_sv = txn.state_vector();
+                let server_empty = server_sv.is_empty();
                 let reply = StateVector::decode_v1(payload)
                     .ok()
                     .map(|sv| txn.encode_state_as_update_v1(&sv));
                 if let Some(diff) = reply {
-                    let _ = out_tx.send(encode_frame(MSG_SYNC_STEP2, &note_id, &diff));
+                    // jangan kirim STEP2 kosong-boros: kalau server kosong, diff pasti kosong
+                    if !server_empty || !diff.is_empty() {
+                        let _ = out_tx.send(encode_frame(MSG_SYNC_STEP2, &note_id, &diff));
+                    }
                 }
                 let sv = txn.state_vector().encode_v1();
                 drop(txn);
                 drop(doc);
-                let _ = out_tx.send(encode_frame(MSG_SYNC_STEP1, &note_id, &sv));
+                // ANTI-HANTU: kalau client tidak punya apa pun (SV kosong) DAN
+                // server juga tidak punya note ini — jangan balas STEP1.
+                // Balasan STEP1 memicu client mengirim STEP2 kosong yang lalu
+                // tersimpan sebagai dokumen hantu di server.
+                if !client_sv_empty || !server_empty {
+                    let _ = out_tx.send(encode_frame(MSG_SYNC_STEP1, &note_id, &sv));
+                }
             }
             MSG_PING => {
                 let frame = encode_frame(MSG_PONG, &note_id, payload);
