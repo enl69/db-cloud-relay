@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
+use yrs::types::Map;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
 use crate::store::Store;
@@ -33,6 +34,15 @@ pub struct VaultRoom {
     /// berhenti memproses/menyiarkan frame — mencegah klien state-basi
     /// mengotori vault yang baru direset.
     generation: std::sync::atomic::AtomicU64,
+    /// KIBLAT: cache path → note-id pemilik sah (1 path = 1 note).
+    /// Sumber kebenaran tunggal penegakan aturan anti-dobel.
+    path_owner: Mutex<HashMap<String, String>>,
+    /// KIBLAT: membuat urutan cek-pemilik → terap → simpan → klaim jadi
+    /// ATOMIK antar semua koneksi — menutup race dua device mengklaim
+    /// path yang sama hampir bersamaan (keduanya lolos cek terpisah).
+    write_lock: std::sync::Mutex<()>,
+    /// true bila path_owner sudah diisi dari store (lazy init per room).
+    indexed: std::sync::atomic::AtomicBool,
 }
 
 impl VaultRoom {
@@ -42,17 +52,76 @@ impl VaultRoom {
             docs: Mutex::new(HashMap::new()),
             tx,
             generation: std::sync::atomic::AtomicU64::new(1),
+            path_owner: Mutex::new(HashMap::new()),
+            write_lock: std::sync::Mutex::new(()),
+            indexed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn reset(&self) {
         self.docs.lock().unwrap().clear();
+        self.path_owner.lock().unwrap().clear();
+        self.indexed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Isi ulang cache path→owner dari store (dipakai room baru / pasca
+    /// dedup). Naikkan generation agar koneksi basi diputus dan klien
+    /// menarik ulang DOC_LIST yang sudah bersih.
+    pub fn rebuild(&self, store: &Store, vault_id: &str) {
+        let map = store.build_path_index(vault_id);
+        *self.path_owner.lock().unwrap() = map;
+        self.docs.lock().unwrap().clear();
+        self.indexed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lazy init indeks kiblat saat koneksi pertama masuk.
+    pub fn ensure_indexed(&self, store: &Store, vault_id: &str) {
+        if !self.indexed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.rebuild(store, vault_id);
+        }
+    }
+
+    /// KIBLAT sweep: bersihkan pelanggaran yang sudah tersimpan lalu
+    /// rebuild cache — atomik terhadap apply klien (write_lock).
+    /// Kembalikan jumlah note yang dihapus.
+    pub fn sweep(&self, store: &Store, vault_id: &str) -> i64 {
+        let _wl = self.write_lock.lock().unwrap();
+        let removed = store.dedup_paths(vault_id);
+        if removed > 0 {
+            let map = store.build_path_index(vault_id);
+            *self.path_owner.lock().unwrap() = map;
+            self.docs.lock().unwrap().clear();
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        removed
+    }
+
+    /// Perbarui klaim path note setelah update diterapkan:
+    /// - deleted → lepas semua klaim note
+    /// - pindah path → lepas klaim lama, klaim path baru
+    fn claim_path(&self, note_id: &str, path: Option<&str>, deleted: bool) {
+        let mut idx = self.path_owner.lock().unwrap();
+        if deleted {
+            idx.retain(|_p, id| id != note_id);
+            return;
+        }
+        let Some(path) = path else { return };
+        if path.is_empty() {
+            return;
+        }
+        idx.retain(|p, id| id != note_id || p == path);
+        idx.insert(path.to_string(), note_id.to_string());
     }
 
     fn doc(&self, store: &Store, vault_id: &str, note_id: &str) -> Arc<Mutex<Doc>> {
@@ -120,7 +189,7 @@ pub async fn handle_socket(
     let conn_generation = room.generation();
     let generation_room = room.clone();
 
-    let (mut sink, mut stream) = socket.split();
+    let (mut sink, stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut bcast = room.tx.subscribe();
 
@@ -226,6 +295,61 @@ pub async fn handle_socket(
                 let _ = out_tx.send(frame);
             }
             MSG_SYNC_STEP2 | MSG_UPDATE => {
+                // ═══════════════════════════════════════════════════════
+                // ATURAN KIBLAT SERVER (path uniqueness):
+                // satu path = satu note-id. Device (terutama yang lama /
+                // ber-index basi) yang mengirim note-id berbeda untuk path
+                // yang sudah dimiliki note lain DITOLAK — server tidak
+                // pernah menyimpan dobel. Balas state pemilik sah agar
+                // plugin baru (0.13.8+) mengadopsi ID kanonik.
+                //
+                // write_lock membuat cek → terap → simpan → klaim path
+                // ATOMIK antar koneksi: dua device yang mengklaim path
+                // baru yang sama hampir bersamaan tak bisa lolos berdua.
+                // ═══════════════════════════════════════════════════════
+                let incoming_path: Option<String> = {
+                    let probe = yrs::Doc::new();
+                    if let Ok(u) = Update::decode_v1(payload) {
+                        let mut txn = probe.transact_mut();
+                        let _ = txn.apply_update(u);
+                        drop(txn);
+                        let txn = probe.transact();
+                        txn.get_map("meta").and_then(|m| {
+                            m.get(&txn, "path").and_then(|v| match v {
+                                yrs::Out::Any(yrs::Any::String(s)) => {
+                                    Some(s.to_string())
+                                }
+                                _ => None,
+                            })
+                        })
+                    } else {
+                        None
+                    }
+                };
+
+                let _kiblat_guard = room.write_lock.lock().unwrap();
+
+                if let Some(path) = incoming_path.as_ref() {
+                    if !path.is_empty() {
+                        let owner = room.path_owner.lock().unwrap().get(path).cloned();
+                        if let Some(owner_id) = owner {
+                            if owner_id != note_id {
+                                warn!(%vault_id, %note_id, path = %path,
+                                      owner = %owner_id,
+                                      "UPDATE DITOLAK: path sudah dimiliki note lain (kiblat)");
+                                let owner_doc = room.doc(&store, &vault_id, &owner_id);
+                                let od = owner_doc.lock().unwrap();
+                                let txn = od.transact();
+                                let full = txn.encode_state_as_update_v1(&StateVector::default());
+                                drop(txn);
+                                drop(od);
+                                let _ = out_tx.send(encode_frame(MSG_UPDATE, &owner_id, &full));
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let applied = {
                     let doc = doc.lock().unwrap();
                     match Update::decode_v1(payload) {
@@ -240,6 +364,25 @@ pub async fn handle_socket(
                     warn!(%vault_id, %note_id, "failed to apply update");
                     continue;
                 }
+                // baca meta final (path/deleted) SETELAH terap untuk
+                // pemeliharaan indeks kiblat (rename / delete)
+                let (final_path, final_deleted) = {
+                    let d = doc.lock().unwrap();
+                    let txn = d.transact();
+                    let meta = txn.get_map("meta");
+                    let p = meta.as_ref().and_then(|m| {
+                        m.get(&txn, "path").and_then(|v| match v {
+                            yrs::Out::Any(yrs::Any::String(s)) => Some(s.to_string()),
+                            _ => None,
+                        })
+                    });
+                    let del = meta
+                        .as_ref()
+                        .and_then(|m| m.get(&txn, "deleted"))
+                        .map(|v| matches!(v, yrs::Out::Any(yrs::Any::Bool(true))))
+                        .unwrap_or(false);
+                    (p, del)
+                };
                 let pending = store.append_update(&vault_id, &note_id, payload);
                 if pending >= SQUASH_THRESHOLD {
                     let doc = doc.lock().unwrap();
@@ -249,6 +392,7 @@ pub async fn handle_socket(
                     drop(doc);
                     store.squash(&vault_id, &note_id, &full);
                 }
+                room.claim_path(&note_id, final_path.as_deref(), final_deleted);
                 let frame = encode_frame(MSG_UPDATE, &note_id, payload);
                 let _ = room.tx.send(BroadcastMsg { conn_id, frame });
             }

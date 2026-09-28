@@ -4,8 +4,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use yrs::updates::decoder::Decode;
 use yrs::types::Map;
-use yrs::{Doc, Out, ReadTxn, Transact, Update};
-use yrs::types::MapRef;
+use yrs::{Doc, Out, ReadTxn, Text, Transact, Update};
 
 pub struct Store {
     pub conn: Mutex<Connection>,
@@ -192,6 +191,151 @@ impl Store {
             }
         }
         count
+    }
+
+
+
+    /// KIBLAT: scan semua note-id vault → (note_id, path, deleted, text_len).
+    /// Urutan deterministik: snapshot `notes` (rowid = urutan simpan) dulu,
+    /// lalu note yang hanya ada di `updates`. Pemilik kanonik = entri
+    /// PERTAMA yang mengklaim path (semantik "server-first").
+    ///
+    /// PENTING: lock koneksi WAJIB dilepas sebelum `load_doc_blobs`
+    /// (rusqlite Mutex tidak reentrant — nested lock = deadlock).
+    fn scan_note_paths(&self, vault_id: &str) -> Vec<(String, Option<String>, bool, usize)> {
+        let ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut ids = Vec::new();
+            let mut stmt = conn
+                .prepare("SELECT note_id FROM notes WHERE vault_id = ?1 ORDER BY rowid")
+                .unwrap();
+            for r in stmt
+                .query_map([vault_id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+            {
+                ids.push(r);
+            }
+            drop(stmt);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT note_id FROM updates WHERE vault_id = ?1
+                     AND note_id NOT IN (SELECT note_id FROM notes WHERE vault_id = ?1)
+                     GROUP BY note_id ORDER BY MIN(seq)",
+                )
+                .unwrap();
+            for r in stmt
+                .query_map([vault_id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+            {
+                ids.push(r);
+            }
+            ids
+        };
+        let mut out = Vec::new();
+        for nid in ids {
+            let blobs = self.load_doc_blobs(vault_id, &nid);
+            if blobs.is_empty() {
+                continue;
+            }
+            let doc = Doc::new();
+            for b in &blobs {
+                if let Ok(u) = Update::decode_v1(b.as_slice()) {
+                    let mut txn = doc.transact_mut();
+                    let _ = txn.apply_update(u);
+                }
+            }
+            let txn = doc.transact();
+            let meta = txn.get_map("meta");
+            let deleted = meta
+                .as_ref()
+                .and_then(|m| m.get(&txn, "deleted"))
+                .map(|v| matches!(v, Out::Any(yrs::Any::Bool(true))))
+                .unwrap_or(false);
+            let path = meta.and_then(|m| {
+                m.get(&txn, "path").and_then(|v| match v {
+                    Out::Any(yrs::Any::String(s)) => Some(s.to_string()),
+                    _ => None,
+                })
+            });
+            let text_len = txn
+                .get_text("content")
+                .map(|t| t.len(&txn) as usize)
+                .unwrap_or(0);
+            out.push((nid, path, deleted, text_len));
+        }
+        out
+    }
+
+    /// KIBLAT: indeks path → note-id pemilik sah (1 path = 1 note).
+    /// Untuk VaultRoom (cache in-memory penegakan aturan).
+    pub fn build_path_index(&self, vault_id: &str) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        for (nid, path, deleted, _len) in self.scan_note_paths(vault_id) {
+            if deleted {
+                continue;
+            }
+            if let Some(p) = path {
+                if !p.is_empty() {
+                    map.entry(p).or_insert(nid);
+                }
+            }
+        }
+        map
+    }
+
+    /// KIBLAT: bersihkan pelanggaran yang SUDAH tersimpan (warisan era lama):
+    /// (a) dobel path — pertahankan pemilik PERTAMA, hapus baris sisanya;
+    /// (b) hantu — note tanpa path DAN tanpa isi (bukan dokumen metadata).
+    /// Baris dihapus, bukan ditandai: penegakan runtime menolak pengiriman
+    /// ulang ID kalah, sehingga tidak bisa muncul kembali.
+    pub fn dedup_paths(&self, vault_id: &str) -> i64 {
+        let entries = self.scan_note_paths(vault_id);
+        let mut by_path: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut ghosts: Vec<String> = Vec::new();
+        for (nid, path, deleted, text_len) in &entries {
+            if nid.starts_with("__") {
+                continue; // dokumen metadata internal (__attachments__ dll)
+            }
+            if *deleted {
+                continue;
+            }
+            match path {
+                Some(p) if !p.is_empty() => {
+                    by_path.entry(p.clone()).or_default().push(nid.clone())
+                }
+                _ => {
+                    if *text_len == 0 {
+                        ghosts.push(nid.clone());
+                    }
+                }
+            }
+        }
+        let mut losers: Vec<String> = ghosts;
+        for (_path, owners) in &by_path {
+            if owners.len() > 1 {
+                for loser in owners.iter().skip(1) {
+                    losers.push(loser.clone());
+                }
+            }
+        }
+        let removed = losers.len() as i64;
+        if removed > 0 {
+            let conn = self.conn.lock().unwrap();
+            for loser in &losers {
+                let _ = conn.execute(
+                    "DELETE FROM notes WHERE vault_id = ?1 AND note_id = ?2",
+                    rusqlite::params![vault_id, loser],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM updates WHERE vault_id = ?1 AND note_id = ?2",
+                    rusqlite::params![vault_id, loser],
+                );
+            }
+        }
+        removed
     }
 
     /// Jumlah catatan NYATA (tanpa dokumen metadata internal) — untuk dashboard & /info.

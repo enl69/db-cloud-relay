@@ -54,6 +54,69 @@ async fn main() {
         conn_counter: AtomicU64::new(1),
     });
 
+    // ═══ KIBLAT: bersihkan warisan dobel/hantu saat boot (self-healing).
+    // Server adalah kiblat — state yang tidak sah tidak boleh bertahan
+    // melewati restart, dari device mana pun asalnya. ═══
+    {
+        let legacy: Vec<String> = {
+            let conn = state.store.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM vaults").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        for vault_id in legacy {
+            let removed = state.store.dedup_paths(&vault_id);
+            if removed > 0 {
+                info!(%vault_id, removed,
+                      "kiblat boot-sweep: dobel/hantu path warisan dihapus");
+            }
+        }
+    }
+
+    // ═══ KIBLAT: sweeper periodik — jaring pengaman untuk data yang lolos
+    // dari era sebelum aturan, atau regresi di masa depan. Setiap 60 detik
+    // server menegaskan sendiri invariant 1 path = 1 note. ═══
+    {
+        let store = state.store.clone();
+        let rooms_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let vaults: Vec<String> = {
+                    let conn = store.conn.lock().unwrap();
+                    let Ok(mut stmt) = conn.prepare("SELECT id FROM vaults") else {
+                        continue;
+                    };
+                    let rows: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+                        Ok(rows) => rows.flatten().collect(),
+                        Err(_) => continue,
+                    };
+                    rows
+                };
+                for vault_id in vaults {
+                    if let Some(room) = rooms_state.rooms.lock().unwrap().get(&vault_id) {
+                        let removed = room.sweep(&store, &vault_id);
+                        if removed > 0 {
+                            info!(%vault_id, removed,
+                                  "kiblat sweep: dobel/hantu path dibersihkan");
+                        }
+                    } else {
+                        // room belum ada → tidak ada klien aktif; bersihkan
+                        // langsung di store, room berikutnya membangun indeks
+                        // dari state yang sudah bersih
+                        let removed = store.dedup_paths(&vault_id);
+                        if removed > 0 {
+                            info!(%vault_id, removed,
+                                  "kiblat sweep (idle): dobel/hantu path dibersihkan");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
@@ -62,6 +125,7 @@ async fn main() {
         .route("/v1/vaults/{vault_id}/info", get(vault_info))
         .route("/v1/vaults/{vault_id}/ids", get(vault_ids))
         .route("/v1/vaults/{vault_id}/counts", get(vault_counts))
+        .route("/v1/vaults/{vault_id}/dedup", post(vault_dedup))
         .route("/v1/blobs/{sha}", get(get_blob).put(put_blob))
         .route("/sync/{vault_id}", get(sync_ws))
         .layer(middleware::from_fn(cors_mw))
@@ -286,6 +350,29 @@ async fn vault_counts(
     }))
 }
 
+
+/// Bersihkan pelanggaran kiblat yang SUDAH tersimpan (warisan era lama):
+/// untuk tiap path dengan >1 note-id, pertahankan PEMILIK PERTAMA
+/// (kanonik), hapus baris sisanya; hantu tanpa path+isi juga dihapus.
+/// Sweep berjalan atomik terhadap apply klien via write_lock room.
+async fn vault_dedup(
+    Path(vault_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let token = params.get("token").cloned().unwrap_or_default();
+    if !state.store.vault_token_valid(&vault_id, &token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let removed = if let Some(room) = state.rooms.lock().unwrap().get(&vault_id) {
+        room.sweep(&state.store, &vault_id)
+    } else {
+        state.store.dedup_paths(&vault_id)
+    };
+    info!(%vault_id, removed, "dedup selesai — server kini 1 path 1 note");
+    Ok(Json(serde_json::json!({ "removed": removed })))
+}
+
 async fn sync_ws(
     ws: WebSocketUpgrade,
     Path(vault_id): Path<String>,
@@ -303,6 +390,10 @@ async fn sync_ws(
             .or_insert_with(|| Arc::new(VaultRoom::new()))
             .clone()
     };
+    // KIBLAT: pastikan cache path→owner terisi dari store sebelum koneksi
+    // mulai bertukar frame (rebuild menaikkan generation → koneksi ini
+    // merekam generation baru, bukan yang basi).
+    room.ensure_indexed(&state.store, &vault_id);
     let store = state.store.clone();
     let conn_id = state
         .conn_counter

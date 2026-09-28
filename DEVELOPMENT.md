@@ -176,6 +176,46 @@ protokol jika menulis client baru.
 | Squash otomatis di server | mencegah bloat (lihat §9 insiden) |
 | CORS `*` di `/v1/*` | plugin Obsidian fetch via `app://obsidian.md` origin; preflight OPTIONS 204 |
 
+### ATURAN KIBLAT SERVER (v0.3.5 — invariant tertinggi, keputusan user)
+
+> **Server adalah kiblat. 1 path = 1 note. Dilarang dobel. Dilarang data lama.**
+
+Semua fix dobel sebelum v0.3.5 ada di CLIENT — device lama / index basi
+tetap bisa mengotori server (5 insiden). Mulai v0.3.5 server MENEGAKKAN
+sendiri, dari device mana pun asalnya:
+
+1. **Tolak klaim path yang sudah dimiliki** (`sync.rs`, arm STEP2/UPDATE):
+   update dengan `meta.path` milik note-id lain DITOLAK, tidak pernah
+   di-apply / disimpan / disiarkan. Server membalas **state penuh pemilik
+   sah** (`MSG_UPDATE` dengan note-id pemilik) — plugin 0.13.8+ mengadopsi
+   ID kanonik; plugin lama diabaikan tapi server tetap bersih.
+2. **Atomik via `write_lock`** (per room): urutan cek-pemilik → terap →
+   simpan → klaim path dijalankan eksklusif antar semua koneksi — dua
+   device yang klaim path baru yang sama hampir bersamaan tidak bisa
+   lolos berdua (race tertutup).
+3. **Cache `path_owner`** (path → note-id) di `VaultRoom`: sumber kebenaran
+   penegakan in-memory; dibangun dari store (`build_path_index`, urutan:
+   `notes` rowid dulu lalu `updates` MIN(seq) = "pertama dilihat server"
+   menang — semantik server-first). Pemeliharaan rename/delete via
+   `claim_path`.
+4. **Sweep self-healing**: `dedup_paths` (a) hapus note-id kalah untuk path
+   yang punya >1 pemilik, (b) hapus hantu (note tanpa path DAN tanpa isi,
+   bukan `__metadata__`). Dijalankan: **saat boot** (semua vault), **tiap
+   60 detik** (sweeper; kalau ada perubahan → rebuild room + generation
+   bump supaya koneksi basi putus dan klien menarik DOC_LIST bersih), dan
+   **endpoint `POST /v1/vaults/{id}/dedup`** (manual).
+5. Baris kalah DIHAPUS (bukan tombstone): penegakan runtime menolak
+   pengiriman ulang ID kalah, jadi tidak bisa muncul kembali. Device
+   pemilik ID kalah membersihkan dirinya via rejoin "ganti total".
+
+Pitfall yang pernah ada di draft (jangan ulangi): `find_path_owner` lama
+memegang lock koneksi sambil memanggil `load_doc_blobs` (lock lagi) =
+**deadlock nested-lock**. Aturan: KALAU scan butuh decode per-note,
+kumpulkan ID dulu, LEPAS lock, baru `load_doc_blobs`.
+
+Uji: `npm run e2e-kiblat` di repo plugin (7 test: tolak dobel + balas
+pemilik + idempoten + race + sweep warisan + device sah selamat).
+
 ## 8. Roadmap / Pekerjaan Lanjutan
 
 1. **Rencana ops (disetujui, ditunda sampai stabil)**: GitHub Actions
