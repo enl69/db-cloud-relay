@@ -338,18 +338,11 @@ impl Store {
         removed
     }
 
-    /// Jumlah catatan NYATA (tanpa dokumen metadata internal) — untuk dashboard & /info.
+    /// Jumlah catatan AKTIF yang benar-benar dapat dipulihkan: punya
+    /// meta.path tidak kosong, tidak deleted, dan path unik. ID database
+    /// saja tidak cukup karena tombstone/ghost tidak menjadi file join.
     pub fn count_real_notes(&self, vault_id: &str) -> i64 {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM (SELECT note_id FROM notes WHERE vault_id = ?1
-             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__', '__devices__')
-             UNION SELECT note_id FROM updates WHERE vault_id = ?1
-             AND note_id NOT IN ('__attachments__', '__hiddens__', '__folders__', '__devices__'))",
-            [vault_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
+        self.build_path_index(vault_id).len() as i64
     }
 
     pub fn load_doc_blobs(&self, vault_id: &str, note_id: &str) -> Vec<Vec<u8>> {
