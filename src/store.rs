@@ -196,6 +196,7 @@ impl Store {
                         entry.get(&txn, "deleted"),
                         Some(Out::Any(yrs::Any::Bool(true)))
                     ),
+                    Out::Any(yrs::Any::Bool(active)) => !active,
                     _ => false,
                 };
                 if !deleted {
