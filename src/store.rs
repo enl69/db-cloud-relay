@@ -145,17 +145,30 @@ impl Store {
     }
 
     pub fn list_notes(&self, vault_id: &str) -> Vec<String> {
+        // DOC_LIST hanya boleh berisi catatan aktif yang punya path valid.
+        // Row tombstone/deleted tidak dikirim ke device join: mengirimnya
+        // membuat client menghidupkan ID lama atau menghasilkan selisih -1.
+        let mut ids: Vec<String> = self.build_path_index(vault_id).into_values().collect();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT note_id FROM (SELECT note_id FROM notes WHERE vault_id = ?1
-                 UNION SELECT note_id FROM updates WHERE vault_id = ?1)",
-            )
+            .prepare("SELECT note_id FROM notes WHERE vault_id = ?1 AND note_id LIKE '__%'")
             .unwrap();
-        stmt.query_map([vault_id], |r| r.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        ids.extend(
+            stmt.query_map([vault_id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok()),
+        );
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT note_id FROM updates WHERE vault_id = ?1 AND note_id LIKE '__%'")
+            .unwrap();
+        ids.extend(
+            stmt.query_map([vault_id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok()),
+        );
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
 
