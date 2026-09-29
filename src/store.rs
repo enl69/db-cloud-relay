@@ -151,7 +151,7 @@ impl Store {
         let mut ids: Vec<String> = self.build_path_index(vault_id).into_values().collect();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT note_id FROM notes WHERE vault_id = ?1 AND note_id LIKE '__%'")
+            .prepare("SELECT note_id FROM notes WHERE vault_id = ?1 AND substr(note_id, 1, 2) = '__'")
             .unwrap();
         ids.extend(
             stmt.query_map([vault_id], |r| r.get::<_, String>(0))
@@ -159,7 +159,7 @@ impl Store {
                 .filter_map(|r| r.ok()),
         );
         let mut stmt = conn
-            .prepare("SELECT DISTINCT note_id FROM updates WHERE vault_id = ?1 AND note_id LIKE '__%'")
+            .prepare("SELECT DISTINCT note_id FROM updates WHERE vault_id = ?1 AND substr(note_id, 1, 2) = '__'")
             .unwrap();
         ids.extend(
             stmt.query_map([vault_id], |r| r.get::<_, String>(0))
